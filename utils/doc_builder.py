@@ -736,7 +736,7 @@ def add_images_to_doc(doc_path: str, image_paths: list, captions: list = None,
                 selection.Font.Size = 8
                 selection.Font.Color = 6710886  # Gray color (RGB: 102, 102, 102)
                 selection.TypeText(captions[idx])
-                selection.Font.Size = 11  # Reset to default
+                selection.Font.Size = 12  # Reset to default
                 selection.Font.Color = 0  # Reset to black
                 selection.TypeParagraph()
         
