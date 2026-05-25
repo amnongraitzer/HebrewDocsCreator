@@ -161,7 +161,7 @@ def _is_heading_line(line: str) -> bool:
     return detection_text.startswith('#')
 
 
-def _process_text(text: str) -> List[Tuple[str, str]]:
+def _process_text(text: str) -> List[Tuple[str, str, int]]:
     """
     Process text into list of (content, style_type) tuples.
     Detects bullets, numbered lists, headings and splits into paragraphs.
@@ -180,9 +180,11 @@ def _process_text(text: str) -> List[Tuple[str, str]]:
         text: Input text to process
         
     Returns:
-        List of tuples: (content, style_type)
+        List of tuples: (content, style_type, depth)
         - content: Text content (markers removed if present, RLM added if needed)
         - style_type: 'normal', 'bullet', 'number', or 'heading1'
+        - depth: nesting level from leading whitespace (0-4), used to indent
+          normal paragraphs (RDN-017)
     """
     import re
     lines = text.splitlines()
@@ -193,9 +195,14 @@ def _process_text(text: str) -> List[Tuple[str, str]]:
         
         # Empty line = paragraph break
         if not stripped:
-            result.append(('', 'normal'))
+            result.append(('', 'normal', 0))
             continue
         
+        # RDN-017: nesting depth from leading whitespace, BEFORE stripping.
+        # Tabs -> 4 spaces, ~2 spaces per level, cap at 4 (Gemini directive).
+        leading_ws = line[:len(line) - len(line.lstrip(' \t'))].replace('\t', '    ')
+        depth = min(len(leading_ws) // 2, 4)
+
         # Check line type in order of priority
         if _is_heading_line(line):
             # Calculate heading level (count #)
@@ -222,7 +229,7 @@ def _process_text(text: str) -> List[Tuple[str, str]]:
         if content and not _is_hebrew_char(content[-1]):
             content = content + RLM
         
-        result.append((content, style_type))
+        result.append((content, style_type, depth))
     
     return result
 
@@ -257,7 +264,7 @@ def _add_content_to_doc(doc, text: str, word_app) -> None:
     # Move to end of document
     selection.EndKey(Unit=6)  # 6 = wdStory
     
-    for content, style_type in processed:
+    for content, style_type, depth in processed:
         # FIRST: Remove any inherited list formatting
         selection.Range.ListFormat.RemoveNumbers()
         
@@ -287,9 +294,23 @@ def _add_content_to_doc(doc, text: str, word_app) -> None:
             selection.Range.ListFormat.ApplyNumberDefault()
         # else: normal paragraph, no special formatting
         
+        # RDN-017: indent normal paragraphs + headings by nesting level (RTL,
+        # 18pt/level). Bullets/numbers keep Word's native relative indent
+        # (reset to 0 so they don't inherit a prior paragraph's indent).
+        if style_type.startswith('heading'):
+            try:
+                _lvl = int(style_type.replace('heading', ''))
+            except ValueError:
+                _lvl = 1
+            selection.ParagraphFormat.RightIndent = max(min(_lvl, 4) - 1, 0) * 18
+        elif style_type in ('bullet', 'number'):
+            selection.ParagraphFormat.RightIndent = 0
+        else:
+            selection.ParagraphFormat.RightIndent = depth * 18
+
         # Type the content
         selection.TypeText(content)
-        
+
         # Move to new paragraph
         selection.TypeParagraph()
         
@@ -544,7 +565,7 @@ def prepend_to_existing_doc(doc_path: str, text: str, separator: str = "-" * 60)
         # Process and add the new content
         processed = _process_text(text)
         
-        for content, style_type in processed:
+        for content, style_type, depth in processed:
             # Remove any inherited list formatting
             selection.Range.ListFormat.RemoveNumbers()
             
@@ -571,6 +592,19 @@ def prepend_to_existing_doc(doc_path: str, text: str, separator: str = "-" * 60)
             elif style_type == 'number':
                 selection.Range.ListFormat.ApplyNumberDefault()
             
+            # RDN-017: indent normal paragraphs + headings by nesting level (RTL,
+            # 18pt/level). Bullets/numbers keep Word's native relative indent.
+            if style_type.startswith('heading'):
+                try:
+                    _lvl = int(style_type.replace('heading', ''))
+                except ValueError:
+                    _lvl = 1
+                selection.ParagraphFormat.RightIndent = max(min(_lvl, 4) - 1, 0) * 18
+            elif style_type in ('bullet', 'number'):
+                selection.ParagraphFormat.RightIndent = 0
+            else:
+                selection.ParagraphFormat.RightIndent = depth * 18
+
             # Type the content
             selection.TypeText(content)
             selection.TypeParagraph()
