@@ -30,6 +30,7 @@ How Other Projects Can Import and Use:
 """
 
 import os
+import shutil
 import warnings
 import unicodedata
 from typing import List, Tuple
@@ -161,7 +162,7 @@ def _is_heading_line(line: str) -> bool:
     return detection_text.startswith('#')
 
 
-def _process_text(text: str) -> List[Tuple[str, str]]:
+def _process_text(text: str) -> List[Tuple[str, str, int]]:
     """
     Process text into list of (content, style_type) tuples.
     Detects bullets, numbered lists, headings and splits into paragraphs.
@@ -180,9 +181,11 @@ def _process_text(text: str) -> List[Tuple[str, str]]:
         text: Input text to process
         
     Returns:
-        List of tuples: (content, style_type)
+        List of tuples: (content, style_type, depth)
         - content: Text content (markers removed if present, RLM added if needed)
         - style_type: 'normal', 'bullet', 'number', or 'heading1'
+        - depth: nesting level from leading whitespace (0-4), used to indent
+          normal paragraphs (RDN-017)
     """
     import re
     lines = text.splitlines()
@@ -193,9 +196,14 @@ def _process_text(text: str) -> List[Tuple[str, str]]:
         
         # Empty line = paragraph break
         if not stripped:
-            result.append(('', 'normal'))
+            result.append(('', 'normal', 0))
             continue
         
+        # RDN-017: nesting depth from leading whitespace, BEFORE stripping.
+        # Tabs -> 4 spaces, ~2 spaces per level, cap at 4 (Gemini directive).
+        leading_ws = line[:len(line) - len(line.lstrip(' \t'))].replace('\t', '    ')
+        depth = min(len(leading_ws) // 2, 4)
+
         # Check line type in order of priority
         if _is_heading_line(line):
             # Calculate heading level (count #)
@@ -222,21 +230,43 @@ def _process_text(text: str) -> List[Tuple[str, str]]:
         if content and not _is_hebrew_char(content[-1]):
             content = content + RLM
         
-        result.append((content, style_type))
+        result.append((content, style_type, depth))
     
     return result
 
 
 def _get_word_app():
     """
-    Get or create Word application instance.
-    
+    Create an isolated, hidden Word application instance.
+
+    Uses ``DispatchEx`` (not ``Dispatch``) so every call spawns a *new,
+    dedicated* WINWORD.EXE via CoCreateInstance instead of attaching to an
+    already-running instance through the Running Object Table. Bare
+    ``Dispatch`` caused intermittent ``0x800A0BCD`` ("memory or disk problem")
+    failures: when two doc operations overlapped in the server process they
+    shared one Word instance, and whichever finished first called ``Quit()``,
+    tearing Word down under the other. ``DispatchEx`` removes that race and
+    also avoids binding to a half-dead orphaned WINWORD.EXE. This mirrors the
+    standard already used by the rest of the platform's Word-COM paths.
+
     Returns:
-        Word.Application COM object
+        Word.Application COM object (isolated process, hidden, alerts off)
     """
     pythoncom.CoInitialize()
-    word = win32com.client.Dispatch("Word.Application")
+    word = win32com.client.DispatchEx("Word.Application")
     word.Visible = False  # Run in background
+    # Suppress modal dialogs (e.g. a Normal.dotm "file in use" prompt) that
+    # would otherwise hang a headless server with no one to click them.
+    try:
+        word.DisplayAlerts = 0  # wdAlertsNone
+    except Exception:
+        pass
+    # Disable background screen redraw on the hidden instance (faster, and one
+    # fewer thing for an off-screen Word process to trip over).
+    try:
+        word.ScreenUpdating = False
+    except Exception:
+        pass
     return word
 
 
@@ -257,7 +287,7 @@ def _add_content_to_doc(doc, text: str, word_app) -> None:
     # Move to end of document
     selection.EndKey(Unit=6)  # 6 = wdStory
     
-    for content, style_type in processed:
+    for content, style_type, depth in processed:
         # FIRST: Remove any inherited list formatting
         selection.Range.ListFormat.RemoveNumbers()
         
@@ -287,9 +317,23 @@ def _add_content_to_doc(doc, text: str, word_app) -> None:
             selection.Range.ListFormat.ApplyNumberDefault()
         # else: normal paragraph, no special formatting
         
+        # RDN-017: indent normal paragraphs + headings by nesting level (RTL,
+        # 18pt/level). Bullets/numbers keep Word's native relative indent
+        # (reset to 0 so they don't inherit a prior paragraph's indent).
+        if style_type.startswith('heading'):
+            try:
+                _lvl = int(style_type.replace('heading', ''))
+            except ValueError:
+                _lvl = 1
+            selection.ParagraphFormat.RightIndent = max(min(_lvl, 4) - 1, 0) * 18
+        elif style_type in ('bullet', 'number'):
+            selection.ParagraphFormat.RightIndent = 0
+        else:
+            selection.ParagraphFormat.RightIndent = depth * 18
+
         # Type the content
         selection.TypeText(content)
-        
+
         # Move to new paragraph
         selection.TypeParagraph()
         
@@ -363,8 +407,16 @@ def create_doc_from_template(template_path: str, output_path: str, text: str, ti
         # Get Word application
         word = _get_word_app()
         
-        # Open template
-        doc = word.Documents.Open(template_path)
+        # Copy the template to the destination on disk FIRST, then open the
+        # COPY — never open the shared template itself. The template is only
+        # byte-read, so it stays UNLOCKED and a leftover/orphaned Word instance
+        # can't trap the next run behind a "File In Use" modal that wedges all
+        # COM automation. (Open(template) locked it; Documents.Add(Template=...)
+        # raised "A file error" on the real Hebrew template path — so we
+        # copy+open.) The copy is byte-identical, so all branding — logo,
+        # headers/footers, styles, title placeholder — is preserved exactly. (RDN-082)
+        shutil.copyfile(template_path, output_path)
+        doc = word.Documents.Open(output_path)
         
         # Replace title if provided
         if title_text:
@@ -544,7 +596,7 @@ def prepend_to_existing_doc(doc_path: str, text: str, separator: str = "-" * 60)
         # Process and add the new content
         processed = _process_text(text)
         
-        for content, style_type in processed:
+        for content, style_type, depth in processed:
             # Remove any inherited list formatting
             selection.Range.ListFormat.RemoveNumbers()
             
@@ -571,6 +623,19 @@ def prepend_to_existing_doc(doc_path: str, text: str, separator: str = "-" * 60)
             elif style_type == 'number':
                 selection.Range.ListFormat.ApplyNumberDefault()
             
+            # RDN-017: indent normal paragraphs + headings by nesting level (RTL,
+            # 18pt/level). Bullets/numbers keep Word's native relative indent.
+            if style_type.startswith('heading'):
+                try:
+                    _lvl = int(style_type.replace('heading', ''))
+                except ValueError:
+                    _lvl = 1
+                selection.ParagraphFormat.RightIndent = max(min(_lvl, 4) - 1, 0) * 18
+            elif style_type in ('bullet', 'number'):
+                selection.ParagraphFormat.RightIndent = 0
+            else:
+                selection.ParagraphFormat.RightIndent = depth * 18
+
             # Type the content
             selection.TypeText(content)
             selection.TypeParagraph()
@@ -736,7 +801,7 @@ def add_images_to_doc(doc_path: str, image_paths: list, captions: list = None,
                 selection.Font.Size = 8
                 selection.Font.Color = 6710886  # Gray color (RGB: 102, 102, 102)
                 selection.TypeText(captions[idx])
-                selection.Font.Size = 11  # Reset to default
+                selection.Font.Size = 12  # Reset to default
                 selection.Font.Color = 0  # Reset to black
                 selection.TypeParagraph()
         
