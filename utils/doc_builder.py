@@ -30,6 +30,7 @@ How Other Projects Can Import and Use:
 """
 
 import os
+import shutil
 import warnings
 import unicodedata
 from typing import List, Tuple
@@ -236,14 +237,36 @@ def _process_text(text: str) -> List[Tuple[str, str, int]]:
 
 def _get_word_app():
     """
-    Get or create Word application instance.
-    
+    Create an isolated, hidden Word application instance.
+
+    Uses ``DispatchEx`` (not ``Dispatch``) so every call spawns a *new,
+    dedicated* WINWORD.EXE via CoCreateInstance instead of attaching to an
+    already-running instance through the Running Object Table. Bare
+    ``Dispatch`` caused intermittent ``0x800A0BCD`` ("memory or disk problem")
+    failures: when two doc operations overlapped in the server process they
+    shared one Word instance, and whichever finished first called ``Quit()``,
+    tearing Word down under the other. ``DispatchEx`` removes that race and
+    also avoids binding to a half-dead orphaned WINWORD.EXE. This mirrors the
+    standard already used by the rest of the platform's Word-COM paths.
+
     Returns:
-        Word.Application COM object
+        Word.Application COM object (isolated process, hidden, alerts off)
     """
     pythoncom.CoInitialize()
-    word = win32com.client.Dispatch("Word.Application")
+    word = win32com.client.DispatchEx("Word.Application")
     word.Visible = False  # Run in background
+    # Suppress modal dialogs (e.g. a Normal.dotm "file in use" prompt) that
+    # would otherwise hang a headless server with no one to click them.
+    try:
+        word.DisplayAlerts = 0  # wdAlertsNone
+    except Exception:
+        pass
+    # Disable background screen redraw on the hidden instance (faster, and one
+    # fewer thing for an off-screen Word process to trip over).
+    try:
+        word.ScreenUpdating = False
+    except Exception:
+        pass
     return word
 
 
@@ -384,8 +407,16 @@ def create_doc_from_template(template_path: str, output_path: str, text: str, ti
         # Get Word application
         word = _get_word_app()
         
-        # Open template
-        doc = word.Documents.Open(template_path)
+        # Copy the template to the destination on disk FIRST, then open the
+        # COPY — never open the shared template itself. The template is only
+        # byte-read, so it stays UNLOCKED and a leftover/orphaned Word instance
+        # can't trap the next run behind a "File In Use" modal that wedges all
+        # COM automation. (Open(template) locked it; Documents.Add(Template=...)
+        # raised "A file error" on the real Hebrew template path — so we
+        # copy+open.) The copy is byte-identical, so all branding — logo,
+        # headers/footers, styles, title placeholder — is preserved exactly. (RDN-082)
+        shutil.copyfile(template_path, output_path)
+        doc = word.Documents.Open(output_path)
         
         # Replace title if provided
         if title_text:
